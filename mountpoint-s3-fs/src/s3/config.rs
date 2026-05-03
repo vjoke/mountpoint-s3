@@ -51,6 +51,9 @@ pub struct ClientConfig {
 
     /// Value for the user-agent header
     pub user_agent: UserAgent,
+
+    /// Automatically follow HTTP redirects on GetObject requests
+    pub follow_redirects: bool,
 }
 
 #[derive(Debug)]
@@ -156,6 +159,9 @@ impl ClientConfig {
         }
         if let Some(owner) = &self.expected_bucket_owner {
             client_config = client_config.bucket_owner(owner);
+        }
+        if self.follow_redirects {
+            client_config = client_config.follow_redirects(true);
         }
         // Transient errors are really bad for file systems (applications don't usually expect them), so
         // let's be more stubborn than the SDK default. With the CRT defaults of 500ms backoff, full

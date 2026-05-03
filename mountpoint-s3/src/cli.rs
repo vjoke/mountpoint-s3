@@ -226,6 +226,13 @@ Learn more in Mountpoint's configuration documentation (CONFIGURATION.md).\
 
     #[clap(
         long,
+        help = "Automatically follow HTTP redirects on GetObject requests",
+        help_heading = CLIENT_OPTIONS_HEADER
+    )]
+    pub follow_redirects: bool,
+
+    #[clap(
+        long,
         help = "Owner UID [default: current user's UID]",
         value_parser = value_parser!(u32).range(1..),
         help_heading = MOUNT_OPTIONS_HEADER
@@ -809,6 +816,7 @@ impl CliArgs {
             bind: self.bind.clone(),
             part_config: self.part_config(),
             user_agent,
+            follow_redirects: self.follow_redirects,
         }
     }
 }

@@ -21,7 +21,7 @@ use crate::object_client::{
     ObjectChecksumError, ObjectClientError, ObjectClientResult, ObjectMetadata,
 };
 
-use super::{CancellingMetaRequest, ResponseHeadersError, S3CrtClient, S3Operation, S3RequestError, parse_checksum};
+use super::{CancellingMetaRequest, ResponseHeadersError, S3CrtClient, S3Operation, S3RequestError, is_redirect_status, parse_checksum};
 
 impl S3CrtClient {
     /// Create and begin a new GetObject request. The returned [S3GetObjectResponse] is a [Stream] of
@@ -34,120 +34,156 @@ impl S3CrtClient {
     ) -> Result<S3GetObjectResponse, ObjectClientError<GetObjectError, S3RequestError>> {
         let requested_checksums = params.checksum_mode.as_ref() == Some(&ChecksumMode::Enabled);
         let next_offset = params.range.as_ref().map(|r| r.start).unwrap_or(0);
-        let (event_sender, mut event_receiver) = futures::channel::mpsc::unbounded();
-        let meta_request = {
-            let span =
-                request_span!(self.inner, "get_object", bucket, key, range=?params.range, if_match=?params.if_match);
+        let max_redirects = if self.inner.follow_redirects {
+            self.inner.max_redirects.get()
+        } else {
+            0
+        };
+        let mut redirect_count = 0;
+        let mut redirect_location: Option<String> = None;
 
-            let mut message = self
-                .inner
-                .new_request_template("GET", bucket)
-                .map_err(S3RequestError::construction_failure)?;
+        loop {
+            let (event_sender, mut event_receiver) = futures::channel::mpsc::unbounded();
+            let meta_request = {
+                let span =
+                    request_span!(self.inner, "get_object", bucket, key, range=?params.range, if_match=?params.if_match);
 
-            // Overwrite "accept" header since this returns raw object data.
-            message
-                .set_header(&Header::new("accept", "*/*"))
-                .map_err(S3RequestError::construction_failure)?;
-
-            if requested_checksums {
-                // Add checksum header to receive object checksums.
-                message
-                    .set_header(&Header::new("x-amz-checksum-mode", "enabled"))
+                let mut message = self
+                    .inner
+                    .new_request_template("GET", bucket)
                     .map_err(S3RequestError::construction_failure)?;
-            }
 
-            if let Some(etag) = params.if_match.as_ref() {
-                // Return the object only if its entity tag (ETag) is matched
+                // Apply redirect location if this is a retry
+                if let Some(ref loc) = redirect_location {
+                    message
+                        .redirect_to(loc, &self.inner.allocator)
+                        .map_err(S3RequestError::construction_failure)?;
+                }
+
+                // Overwrite "accept" header since this returns raw object data.
                 message
-                    .set_header(&Header::new("If-Match", etag.as_str()))
+                    .set_header(&Header::new("accept", "*/*"))
                     .map_err(S3RequestError::construction_failure)?;
-            }
 
-            if let Some(range) = params.range.as_ref() {
-                // Range HTTP header is bounded below *inclusive*
-                let range_value = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
+                if requested_checksums {
+                    // Add checksum header to receive object checksums.
+                    message
+                        .set_header(&Header::new("x-amz-checksum-mode", "enabled"))
+                        .map_err(S3RequestError::construction_failure)?;
+                }
+
+                if let Some(etag) = params.if_match.as_ref() {
+                    // Return the object only if its entity tag (ETag) is matched
+                    message
+                        .set_header(&Header::new("If-Match", etag.as_str()))
+                        .map_err(S3RequestError::construction_failure)?;
+                }
+
+                if let Some(range) = params.range.as_ref() {
+                    // Range HTTP header is bounded below *inclusive*
+                    let range_value = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
+                    message
+                        .set_header(&Header::new("Range", range_value))
+                        .map_err(S3RequestError::construction_failure)?;
+                }
+
+                let key = format!("/{key}");
                 message
-                    .set_header(&Header::new("Range", range_value))
+                    .set_request_path(key)
                     .map_err(S3RequestError::construction_failure)?;
-            }
 
-            let key = format!("/{key}");
-            message
-                .set_request_path(key)
-                .map_err(S3RequestError::construction_failure)?;
+                let mut options = message.into_options(S3Operation::GetObject);
+                options.part_size(self.inner.read_part_size as u64);
+                if let Some(id) = params.custom_id {
+                    options.custom_id(id);
+                }
 
-            let mut options = message.into_options(S3Operation::GetObject);
-            options.part_size(self.inner.read_part_size as u64);
-            if let Some(id) = params.custom_id {
-                options.custom_id(id);
-            }
+                let mut headers_sender = Some(event_sender.clone());
+                let part_sender = event_sender.clone();
 
-            let mut headers_sender = Some(event_sender.clone());
-            let part_sender = event_sender.clone();
+                self.inner.meta_request_with_callbacks(
+                    options,
+                    span,
+                    |_| (),
+                    move |headers, status| {
+                        // Only send headers if we have a 2xx status code. If we only get other status codes,
+                        // then on_meta_request_result will send an error.
+                        if (200..300).contains(&status) {
+                            // Headers can be returned multiple times, but the metadata/checksums don't change.
+                            // We only send the first occurence to the channel.
+                            if let Some(headers_sender) = headers_sender.take() {
+                                _ = headers_sender.unbounded_send(S3GetObjectEvent::Headers(headers.clone()));
+                            }
+                        }
+                    },
+                    move |offset, data| {
+                        let owned_buffer = data
+                            .to_owned_buffer()
+                            .expect("buffers returned from GetObject can always be acquired");
+                        let bytes = Bytes::from_owner(owned_buffer);
+                        let body_part = GetBodyPart { offset, data: bytes };
+                        _ = part_sender.unbounded_send(S3GetObjectEvent::BodyPart(body_part));
+                    },
+                    parse_get_object_error,
+                    move |result| {
+                        if let Err(e) = result {
+                            _ = event_sender.unbounded_send(S3GetObjectEvent::Error(e));
+                        }
+                        event_sender.close_channel();
+                    },
+                )?
+            };
 
-            self.inner.meta_request_with_callbacks(
-                options,
-                span,
-                |_| (),
-                move |headers, status| {
-                    // Only send headers if we have a 2xx status code. If we only get other status codes,
-                    // then on_meta_request_result will send an error.
-                    if (200..300).contains(&status) {
-                        // Headers can be returned multiple times, but the metadata/checksums don't change.
-                        // We only send the first occurence to the channel.
-                        if let Some(headers_sender) = headers_sender.take() {
-                            _ = headers_sender.unbounded_send(S3GetObjectEvent::Headers(headers.clone()));
+            match event_receiver.next().await {
+                Some(S3GetObjectEvent::Headers(headers)) => {
+                    let backpressure_handle = if self.inner.enable_backpressure {
+                        let read_window_end_offset =
+                            Arc::new(AtomicU64::new(next_offset + self.inner.initial_read_window_size as u64));
+                        Some(S3BackpressureHandle {
+                            read_window_end_offset,
+                            meta_request: meta_request.clone(),
+                        })
+                    } else {
+                        None
+                    };
+                    return Ok(S3GetObjectResponse {
+                        meta_request,
+                        event_receiver,
+                        requested_checksums,
+                        backpressure_handle,
+                        headers,
+                        next_offset,
+                    });
+                }
+                Some(S3GetObjectEvent::Error(e)) => {
+                    // Check if this is a redirect response we should follow
+                    if let ObjectClientError::ClientError(S3RequestError::ResponseError(ref result)) = e {
+                        if is_redirect_status(result.response_status) {
+                            if redirect_count < max_redirects {
+                                if let Some(headers) = &result.error_response_headers {
+                                    if let Ok(location) = headers.get("Location") {
+                                        redirect_location = Some(
+                                            location.value().to_string_lossy().to_string()
+                                        );
+                                        redirect_count += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                            if redirect_count >= max_redirects {
+                                return Err(S3RequestError::MaxRedirectsExceeded(max_redirects).into());
+                            }
                         }
                     }
-                },
-                move |offset, data| {
-                    let owned_buffer = data
-                        .to_owned_buffer()
-                        .expect("buffers returned from GetObject can always be acquired");
-                    let bytes = Bytes::from_owner(owned_buffer);
-                    let body_part = GetBodyPart { offset, data: bytes };
-                    _ = part_sender.unbounded_send(S3GetObjectEvent::BodyPart(body_part));
-                },
-                parse_get_object_error,
-                move |result| {
-                    if let Err(e) = result {
-                        _ = event_sender.unbounded_send(S3GetObjectEvent::Error(e));
-                    }
-                    event_sender.close_channel();
-                },
-            )?
-        };
-
-        let headers = match event_receiver.next().await {
-            Some(S3GetObjectEvent::Headers(headers)) => headers,
-            Some(S3GetObjectEvent::Error(e)) => {
-                return Err(e);
+                    return Err(e);
+                }
+                event => {
+                    // If we did not received the headers first, the request must have failed.
+                    trace!(?event, "unexpected GetObject event while waiting for headers");
+                    return Err(S3RequestError::internal_failure(ResponseHeadersError::MissingHeaders).into());
+                }
             }
-            event => {
-                // If we did not received the headers first, the request must have failed.
-                trace!(?event, "unexpected GetObject event while waiting for headers");
-                return Err(S3RequestError::internal_failure(ResponseHeadersError::MissingHeaders).into());
-            }
-        };
-
-        let backpressure_handle = if self.inner.enable_backpressure {
-            let read_window_end_offset =
-                Arc::new(AtomicU64::new(next_offset + self.inner.initial_read_window_size as u64));
-            Some(S3BackpressureHandle {
-                read_window_end_offset,
-                meta_request: meta_request.clone(),
-            })
-        } else {
-            None
-        };
-        Ok(S3GetObjectResponse {
-            meta_request,
-            event_receiver,
-            requested_checksums,
-            backpressure_handle,
-            headers,
-            next_offset,
-        })
+        }
     }
 }
 

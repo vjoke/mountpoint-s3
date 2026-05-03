@@ -114,6 +114,8 @@ pub struct S3ClientConfig {
     telemetry_callback: Option<Arc<dyn OnTelemetry>>,
     event_loop_threads: Option<u16>,
     buffer_pool_factory: Option<MemoryPoolFactoryWrapper>,
+    follow_redirects: bool,
+    max_redirects: NonZeroUsize,
 }
 
 impl Default for S3ClientConfig {
@@ -136,6 +138,8 @@ impl Default for S3ClientConfig {
             telemetry_callback: None,
             event_loop_threads: None,
             buffer_pool_factory: None,
+            follow_redirects: false,
+            max_redirects: NonZeroUsize::new(10).unwrap(),
         }
     }
 }
@@ -221,6 +225,20 @@ impl S3ClientConfig {
     #[must_use = "S3ClientConfig follows a builder pattern"]
     pub fn max_attempts(mut self, max_attempts: NonZeroUsize) -> Self {
         self.max_attempts = Some(max_attempts);
+        self
+    }
+
+    /// Set whether to automatically follow HTTP redirects on GetObject requests.
+    #[must_use = "S3ClientConfig follows a builder pattern"]
+    pub fn follow_redirects(mut self, follow_redirects: bool) -> Self {
+        self.follow_redirects = follow_redirects;
+        self
+    }
+
+    /// Set the maximum number of redirects to follow for GetObject requests.
+    #[must_use = "S3ClientConfig follows a builder pattern"]
+    pub fn max_redirects(mut self, max_redirects: NonZeroUsize) -> Self {
+        self.max_redirects = max_redirects;
         self
     }
 
@@ -340,6 +358,8 @@ struct S3CrtClientInner {
     credentials_provider: Option<CredentialsProvider>,
     host_resolver: HostResolver,
     telemetry_callback: Option<Arc<dyn OnTelemetry>>,
+    follow_redirects: bool,
+    max_redirects: NonZeroUsize,
 }
 
 impl S3CrtClientInner {
@@ -481,6 +501,8 @@ impl S3CrtClientInner {
             credentials_provider: Some(credentials_provider),
             host_resolver,
             telemetry_callback: config.telemetry_callback,
+            follow_redirects: config.follow_redirects,
+            max_redirects: config.max_redirects,
         })
     }
 
@@ -1066,6 +1088,29 @@ impl<'a> S3Message<'a> {
         self.inner.set_header(&header)
     }
 
+    /// Update the endpoint for this message to follow an HTTP redirect.
+    /// Updates the endpoint URI and Host header to match the redirect target.
+    fn redirect_to(
+        &mut self,
+        location: &str,
+        allocator: &Allocator,
+    ) -> Result<(), ConstructionError> {
+        let redirect_uri = Uri::new_from_str(allocator, location)?;
+
+        let hostname = redirect_uri.host_name();
+        let port = redirect_uri.host_port();
+        let hostname_header = if port > 0 {
+            format!("{}:{}", hostname.to_string_lossy(), port)
+        } else {
+            hostname.to_string_lossy().to_string()
+        };
+
+        self.uri = redirect_uri;
+        self.inner.set_header(&Header::new("Host", hostname_header))?;
+
+        Ok(())
+    }
+
     fn into_options(self, operation: S3Operation) -> MetaRequestOptions<'a> {
         let mut options = MetaRequestOptions::new();
         if let Some(checksum_config) = self.checksum_config {
@@ -1212,6 +1257,10 @@ pub enum S3RequestError {
     /// new data.
     #[error("Polled for data with empty read window")]
     EmptyReadWindow,
+
+    /// The maximum number of HTTP redirects was exceeded.
+    #[error("Maximum number of redirects ({0}) exceeded")]
+    MaxRedirectsExceeded(usize),
 }
 
 impl S3RequestError {
@@ -1235,6 +1284,11 @@ impl ProvideErrorMetadata for S3RequestError {
                 error_message: Some("Please reduce your request rate.".to_string()),
             },
             Self::IncorrectRegion(_, metadata) => metadata.clone(),
+            Self::MaxRedirectsExceeded(max) => ClientErrorMetadata {
+                http_code: None,
+                error_code: Some("MaxRedirectsExceeded".to_string()),
+                error_message: Some(format!("Maximum number of redirects ({max}) exceeded")),
+            },
             _ => Default::default(),
         }
     }
@@ -1333,6 +1387,11 @@ fn parse_checksum(headers: &Headers) -> Result<Checksum, HeadersError> {
         checksum_sha1,
         checksum_sha256,
     })
+}
+
+/// Check if an HTTP status code indicates a redirect that should be followed.
+fn is_redirect_status(status: i32) -> bool {
+    matches!(status, 301 | 302 | 307 | 308)
 }
 
 /// Try to parse a modeled error out of a failing meta request
@@ -1884,6 +1943,17 @@ mod tests {
         assert_eq!(message, "This error is made up.");
     }
 
+    fn make_redirect_result(response_status: i32, location: &str) -> MetaRequestResult {
+        let mut headers = Headers::new(&Allocator::default()).unwrap();
+        headers.add_header(&Header::new("Location", location)).unwrap();
+        MetaRequestResult {
+            response_status,
+            crt_error: 1i32.into(),
+            error_response_headers: Some(headers),
+            error_response_body: None,
+        }
+    }
+
     fn make_crt_error_result(response_status: i32, crt_error: Error) -> MetaRequestResult {
         MetaRequestResult {
             response_status,
@@ -1891,6 +1961,41 @@ mod tests {
             error_response_headers: None,
             error_response_body: None,
         }
+    }
+
+    #[test]
+    fn test_is_redirect_status() {
+        assert!(!is_redirect_status(200));
+        assert!(!is_redirect_status(204));
+        assert!(!is_redirect_status(404));
+        assert!(!is_redirect_status(500));
+        assert!(is_redirect_status(301));
+        assert!(is_redirect_status(302));
+        assert!(is_redirect_status(307));
+        assert!(is_redirect_status(308));
+    }
+
+    #[test]
+    fn test_max_redirects_exceeded_error_metadata() {
+        let err = S3RequestError::MaxRedirectsExceeded(10);
+        let meta = err.meta();
+        assert_eq!(meta.http_code, None);
+        assert_eq!(meta.error_code, Some("MaxRedirectsExceeded".to_string()));
+        assert_eq!(
+            meta.error_message,
+            Some("Maximum number of redirects (10) exceeded".to_string())
+        );
+    }
+
+    #[test]
+    fn test_redirect_result_has_location_header() {
+        let result = make_redirect_result(307, "https://bucket.s3.us-west-2.amazonaws.com/key");
+        let headers = result.error_response_headers.as_ref().unwrap();
+        let location = headers.get("Location").unwrap();
+        assert_eq!(
+            location.value().to_string_lossy(),
+            "https://bucket.s3.us-west-2.amazonaws.com/key"
+        );
     }
 
     #[test]
