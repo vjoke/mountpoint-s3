@@ -81,6 +81,11 @@ impl SigningConfigInner {
 pub struct SigningConfig(pub(crate) Pin<Box<SigningConfigInner>>);
 
 impl SigningConfig {
+    /// Create a new [SigningConfig] with default options.
+    pub fn new(region: &str, credentials_provider: CredentialsProvider) -> Self {
+        Self(Box::pin(SigningConfigInner::new(region, credentials_provider)))
+    }
+
     /// Get out the inner pointer to the signing config
     pub(crate) fn to_inner_ptr(&self) -> *const aws_signing_config_aws {
         &self.0.as_ref().get_ref().inner

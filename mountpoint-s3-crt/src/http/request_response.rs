@@ -351,6 +351,17 @@ impl<'a> Message<'a> {
         }
     }
 
+    /// Erase a header from this message. If the header is not present, this is a no-op.
+    pub fn erase_header(&self, name: impl AsRef<OsStr>) -> Result<(), Error> {
+        // SAFETY: `self.inner` is a valid aws_http_message
+        let headers = unsafe { aws_http_message_get_headers(self.inner.as_ptr()) };
+        assert!(!headers.is_null(), "headers are always initialized");
+        // SAFETY: `aws_http_headers_erase` doesn't hold on to a copy of the name
+        unsafe {
+            aws_http_headers_erase(headers, name.as_ref().as_aws_byte_cursor()).ok_or_last_error()
+        }
+    }
+
     /// Set the request path for this message.
     pub fn set_request_path(&mut self, path: impl AsRef<OsStr>) -> Result<(), Error> {
         // SAFETY: `aws_http_message_set_request_path` makes a copy of `path`.

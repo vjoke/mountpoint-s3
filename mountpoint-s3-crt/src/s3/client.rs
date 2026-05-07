@@ -434,6 +434,15 @@ impl<'a> MetaRequestOptions<'a> {
         self
     }
 
+    /// Disable signing for this meta request. This overrides any client-level signing config.
+    pub fn disable_signing(&mut self) -> &mut Self {
+        // SAFETY: we aren't moving out of the struct.
+        let options = unsafe { Pin::get_unchecked_mut(Pin::as_mut(&mut self.0)) };
+        options.signing_config = None;
+        options.inner.signing_config = std::ptr::null_mut();
+        self
+    }
+
     /// Provide a callback to run when telemetry for individual requests made by this meta request
     /// arrives. The callback is invoked once for each request made, after the request completes
     /// (including failures).

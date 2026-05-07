@@ -72,11 +72,16 @@ impl S3CrtClient {
                         .map_err(S3RequestError::construction_failure)?;
                 }
 
-                if let Some(etag) = params.if_match.as_ref() {
-                    // Return the object only if its entity tag (ETag) is matched
-                    message
-                        .set_header(&Header::new("If-Match", etag.as_str()))
-                        .map_err(S3RequestError::construction_failure)?;
+                // Only set If-Match if this is NOT a redirect.
+                // When redirecting to a presigned URL, the URL already encodes the specific object version,
+                // so conditional headers from the original request cause 412 PreconditionFailed errors.
+                if redirect_location.is_none() {
+                    if let Some(etag) = params.if_match.as_ref() {
+                        // Return the object only if its entity tag (ETag) is matched
+                        message
+                            .set_header(&Header::new("If-Match", etag.as_str()))
+                            .map_err(S3RequestError::construction_failure)?;
+                    }
                 }
 
                 if let Some(range) = params.range.as_ref() {
@@ -87,10 +92,14 @@ impl S3CrtClient {
                         .map_err(S3RequestError::construction_failure)?;
                 }
 
-                let key = format!("/{key}");
-                message
-                    .set_request_path(key)
-                    .map_err(S3RequestError::construction_failure)?;
+                // Only set the request path if this is NOT a redirect.
+                // When redirecting, redirect_to() already sets the full path including query string.
+                if redirect_location.is_none() {
+                    let key = format!("/{key}");
+                    message
+                        .set_request_path(key)
+                        .map_err(S3RequestError::construction_failure)?;
+                }
 
                 let mut options = message.into_options(S3Operation::GetObject);
                 options.part_size(self.inner.read_part_size as u64);

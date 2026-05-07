@@ -1089,7 +1089,8 @@ impl<'a> S3Message<'a> {
     }
 
     /// Update the endpoint for this message to follow an HTTP redirect.
-    /// Updates the endpoint URI and Host header to match the redirect target.
+    /// Updates the endpoint URI, Host header, and request path to match the redirect target.
+    /// Also clears signing configuration and AWS auth headers when redirecting to a presigned URL.
     fn redirect_to(
         &mut self,
         location: &str,
@@ -1105,8 +1106,37 @@ impl<'a> S3Message<'a> {
             hostname.to_string_lossy().to_string()
         };
 
-        self.uri = redirect_uri;
+        // Update the endpoint URI (used for connection establishment)
+        self.uri = redirect_uri.clone();
         self.inner.set_header(&Header::new("Host", hostname_header))?;
+
+        // IMPORTANT: The CRT uses the path from the Message, not from the endpoint URI.
+        // We must update the request path to include the full path + query from the redirect URL.
+        // The presigned URL's query string contains the authentication parameters.
+        let path = redirect_uri.path();
+        let query = redirect_uri.query_string();
+        let mut full_path = path.to_os_string();
+        if !query.is_empty() {
+            full_path.push("?");
+            full_path.push(query);
+        }
+        self.inner.set_request_path(full_path)?;
+
+        // When following a redirect to a presigned URL, we must NOT send
+        // the original request's AWS signing headers, as the presigned URL
+        // already contains authentication. Sending both causes 403 errors.
+        // Use anonymous credentials to skip signing completely.
+        let anonymous_provider = CredentialsProvider::new_anonymous(allocator)
+            .map_err(|e| ConstructionError::from(e))?;
+        self.signing_config = Some(SigningConfig::new("us-east-1", anonymous_provider));
+
+        // Remove AWS signing headers that were added by the CRT.
+        // These headers conflict with presigned URL authentication.
+        // Errors are ignored as these headers may not be present.
+        let _ = self.inner.erase_header("Authorization");
+        let _ = self.inner.erase_header("x-amz-content-sha256");
+        let _ = self.inner.erase_header("x-amz-date");
+        let _ = self.inner.erase_header("x-amz-security-token");
 
         Ok(())
     }
