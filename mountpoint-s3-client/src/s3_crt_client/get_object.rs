@@ -102,16 +102,7 @@ impl S3CrtClient {
                 }
 
                 let mut options = message.into_options(S3Operation::GetObject);
-                if redirect_location.is_some() {
-                    // When redirecting to a presigned URL, disable part-wise fetching.
-                    // The presigned URL is signed for a specific Range header. If the CRT
-                    // splits the request into multiple parts with different Range headers,
-                    // the signature will not match. Use a large part size to fetch the
-                    // entire range in a single request.
-                    options.part_size(u64::MAX);
-                } else {
-                    options.part_size(self.inner.read_part_size as u64);
-                }
+                options.part_size(self.inner.read_part_size as u64);
                 if let Some(id) = params.custom_id {
                     options.custom_id(id);
                 }
