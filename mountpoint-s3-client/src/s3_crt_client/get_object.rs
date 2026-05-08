@@ -1,19 +1,21 @@
-use std::ops::Deref;
+use std::collections::BTreeMap;
+use std::ops::{Deref, Range};
 use std::os::unix::prelude::OsStrExt;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::channel::mpsc::UnboundedReceiver;
-use futures::stream::FusedStream;
-use futures::{Stream, StreamExt};
+use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
+use futures::future::LocalBoxFuture;
+use futures::stream::{FusedStream, FuturesUnordered};
+use futures::{FutureExt, Stream, StreamExt};
 use mountpoint_s3_crt::http::request_response::{Header, Headers};
 use mountpoint_s3_crt::s3::client::{MetaRequest, MetaRequestResult, MetaRequestType};
 use pin_project::pin_project;
-use tracing::trace;
+use tracing::{info, trace};
 
 use crate::error_metadata::ClientErrorMetadata;
 use crate::object_client::{
@@ -21,7 +23,10 @@ use crate::object_client::{
     ObjectChecksumError, ObjectClientError, ObjectClientResult, ObjectMetadata,
 };
 
-use super::{CancellingMetaRequest, ResponseHeadersError, S3CrtClient, S3Operation, S3RequestError, is_redirect_status, parse_checksum};
+use super::{
+    CancellingMetaRequest, ResponseHeadersError, S3CrtClient, S3Operation, S3RequestError, is_redirect_status,
+    parse_checksum,
+};
 
 /// Detach a std::thread on drop. The thread will exit naturally when it
 /// detects the receiver has been dropped (e.g., when the [S3GetObjectResponse]
@@ -37,6 +42,108 @@ impl Drop for DetachOnDrop {
     }
 }
 
+const REDIRECT_SPLIT_CHUNK_SIZE: u64 = 1024 * 1024;
+const REDIRECT_SPLIT_MAX_CONCURRENCY: usize = 16;
+const REDIRECT_SPLIT_LOOKAHEAD_CHUNKS: usize = 1;
+
+type ChunkResult = Result<(Option<Headers>, Vec<GetBodyPart>), ObjectClientError<GetObjectError, S3RequestError>>;
+type ChunkTaskResult = (usize, ChunkResult);
+type ChunkTask = LocalBoxFuture<'static, ChunkTaskResult>;
+
+#[derive(Debug)]
+struct ChunkSpec {
+    index: usize,
+    range: Range<u64>,
+}
+
+fn split_chunk_task(
+    client: S3CrtClient,
+    bucket: String,
+    key: String,
+    params: GetObjectParams,
+    spec: ChunkSpec,
+    active_chunks: Arc<AtomicUsize>,
+) -> ChunkTask {
+    async move {
+        let include_headers = spec.index == 0;
+        let index = spec.index;
+        let range = spec.range;
+        let active = active_chunks.fetch_add(1, Ordering::SeqCst) + 1;
+        info!(
+            index,
+            range_start = range.start,
+            range_end = range.end,
+            active,
+            "starting redirected GetObject split chunk"
+        );
+        let result = client
+            .collect_split_chunk(&bucket, &key, &params, range, include_headers)
+            .await;
+        let active = active_chunks.fetch_sub(1, Ordering::SeqCst) - 1;
+        info!(
+            index,
+            active,
+            success = result.is_ok(),
+            "finished redirected GetObject split chunk"
+        );
+        (index, result)
+    }
+    .boxed_local()
+}
+
+struct SplitScheduler {
+    client: S3CrtClient,
+    bucket: String,
+    key: String,
+    params: GetObjectParams,
+    full_range: Range<u64>,
+    chunk_size: u64,
+    total_chunks: usize,
+    max_concurrency: usize,
+    read_window_end_offset: Arc<AtomicU64>,
+    active_chunks: Arc<AtomicUsize>,
+}
+
+impl SplitScheduler {
+    fn schedule(&self, inflight: &mut FuturesUnordered<ChunkTask>, next_chunk_index_to_start: &mut usize) {
+        while *next_chunk_index_to_start < self.total_chunks && inflight.len() < self.max_concurrency {
+            let index = *next_chunk_index_to_start;
+            let start = self.full_range.start + (index as u64 * self.chunk_size);
+            let end = (start + self.chunk_size).min(self.full_range.end);
+            let read_window_end = self.read_window_end_offset.load(Ordering::SeqCst);
+            let scheduling_window_end = read_window_end
+                .saturating_add(self.chunk_size.saturating_mul(REDIRECT_SPLIT_LOOKAHEAD_CHUNKS as u64))
+                .min(self.full_range.end);
+
+            if index != 0 && start >= scheduling_window_end {
+                break;
+            }
+
+            info!(
+                chunk_index = index,
+                range_start = start,
+                range_end = end,
+                read_window_end,
+                scheduling_window_end,
+                inflight = inflight.len(),
+                "scheduling redirected GetObject split chunk"
+            );
+            inflight.push(split_chunk_task(
+                self.client.clone(),
+                self.bucket.clone(),
+                self.key.clone(),
+                self.params.clone(),
+                ChunkSpec {
+                    index,
+                    range: start..end,
+                },
+                self.active_chunks.clone(),
+            ));
+            *next_chunk_index_to_start += 1;
+        }
+    }
+}
+
 impl S3CrtClient {
     /// Create and begin a new GetObject request. The returned [S3GetObjectResponse] is a [Stream] of
     /// body parts of the object, which will be delivered in order.
@@ -46,14 +153,14 @@ impl S3CrtClient {
         key: &str,
         params: &GetObjectParams,
     ) -> Result<S3GetObjectResponse, ObjectClientError<GetObjectError, S3RequestError>> {
-        // When following redirects and the range is larger than the part size,
+        // When following redirects and the range is larger than the redirect chunk size,
         // we must split the range ourselves. The CRT's auto_ranged_get would reuse
         // the same presigned redirect URL for all internal parts, but each presigned
         // URL is signed for a specific Range header, causing SignatureDoesNotMatch
         // errors for parts whose Range doesn't match.
         if self.inner.follow_redirects
             && let Some(range) = params.range.as_ref()
-            && range.end.saturating_sub(range.start) > self.inner.read_part_size as u64
+            && range.end.saturating_sub(range.start) > REDIRECT_SPLIT_CHUNK_SIZE
         {
             return self.get_object_split(bucket, key, params).await;
         }
@@ -91,8 +198,7 @@ impl S3CrtClient {
         loop {
             let (event_sender, mut event_receiver) = futures::channel::mpsc::unbounded();
             let meta_request = {
-                let span =
-                    request_span!(self.inner, "get_object", bucket, key, range=?params.range, if_match=?params.if_match);
+                let span = request_span!(self.inner, "get_object", bucket, key, range=?params.range, if_match=?params.if_match);
 
                 let mut message = self
                     .inner
@@ -195,7 +301,7 @@ impl S3CrtClient {
                         // so to_owned_buffer() can fail. Fall back to copying.
                         let bytes = match data.to_owned_buffer() {
                             Some(owned) => Bytes::from_owner(owned),
-                            None => Bytes::copy_from_slice(&data),
+                            None => Bytes::copy_from_slice(data),
                         };
                         let body_part = GetBodyPart {
                             offset: offset + offset_adjustment,
@@ -243,9 +349,7 @@ impl S3CrtClient {
                         && let Some(headers) = &result.error_response_headers
                         && let Ok(location) = headers.get("Location")
                     {
-                        redirect_location = Some(
-                            location.value().to_string_lossy().to_string()
-                        );
+                        redirect_location = Some(location.value().to_string_lossy().to_string());
                         redirect_count += 1;
                         continue;
                     }
@@ -266,8 +370,32 @@ impl S3CrtClient {
         }
     }
 
-    /// Split a large-range GetObject into sequential chunk requests.
-    /// Each chunk is at most `read_part_size` bytes and uses its own meta-request,
+    async fn collect_split_chunk(
+        &self,
+        bucket: &str,
+        key: &str,
+        params: &GetObjectParams,
+        range: Range<u64>,
+        include_headers: bool,
+    ) -> ChunkResult {
+        let chunk_params = GetObjectParams {
+            range: Some(range),
+            ..params.clone()
+        };
+
+        let mut response = self.get_object_single(bucket, key, &chunk_params, true, true).await?;
+        let headers = include_headers.then(|| response.headers.clone());
+        let mut parts = Vec::new();
+
+        while let Some(result) = response.next().await {
+            parts.push(result?);
+        }
+
+        Ok((headers, parts))
+    }
+
+    /// Split a large-range GetObject into bounded-concurrency chunk requests.
+    /// Each chunk is at most `REDIRECT_SPLIT_CHUNK_SIZE` bytes and uses its own meta-request,
     /// so each chunk handles redirects independently.
     async fn get_object_split(
         &self,
@@ -276,60 +404,84 @@ impl S3CrtClient {
         params: &GetObjectParams,
     ) -> Result<S3GetObjectResponse, ObjectClientError<GetObjectError, S3RequestError>> {
         let full_range = params.range.as_ref().expect("split only called with range").clone();
-        let chunk_size = self.inner.read_part_size as u64;
+        let chunk_size = REDIRECT_SPLIT_CHUNK_SIZE;
         let requested_checksums = params.checksum_mode.as_ref() == Some(&ChecksumMode::Enabled);
         let next_offset = full_range.start;
+        let initial_read_window_end_offset = if self.inner.enable_backpressure {
+            next_offset.saturating_add(self.inner.initial_read_window_size as u64)
+        } else {
+            u64::MAX
+        };
+        let read_window_end_offset = Arc::new(AtomicU64::new(initial_read_window_end_offset));
 
         // Channel to merge all chunk streams into one
         let (event_sender, mut event_receiver) = futures::channel::mpsc::unbounded();
+        let (read_window_update_sender, mut read_window_update_receiver) = futures::channel::mpsc::unbounded();
 
         let self_clone = self.clone();
         let bucket = bucket.to_string();
         let key = key.to_string();
         let params = params.clone();
+        let split_read_window_end_offset = read_window_end_offset.clone();
 
         let task = std::thread::spawn(move || {
             futures::executor::block_on(async move {
-                let mut current_offset = full_range.start;
-                let mut headers_sent = false;
+                let range_start = full_range.start;
+                let range_end = full_range.end;
+                let range_len = range_end.saturating_sub(range_start);
+                let total_chunks = range_len.div_ceil(chunk_size) as usize;
+                let max_concurrency = REDIRECT_SPLIT_MAX_CONCURRENCY.min(total_chunks);
+                let active_chunks = Arc::new(AtomicUsize::new(0));
+                info!(
+                    range_start,
+                    range_end, total_chunks, max_concurrency, chunk_size, "starting redirected GetObject split"
+                );
 
-                while current_offset < full_range.end {
-                    let chunk_end = (current_offset + chunk_size).min(full_range.end);
-                    let chunk_range = current_offset..chunk_end;
+                let scheduler = SplitScheduler {
+                    client: self_clone,
+                    bucket,
+                    key,
+                    params,
+                    full_range,
+                    chunk_size,
+                    total_chunks,
+                    max_concurrency,
+                    read_window_end_offset: split_read_window_end_offset,
+                    active_chunks,
+                };
+                let mut next_chunk_index_to_start = 0;
+                let mut next_chunk_index_to_emit = 0;
+                let mut inflight: FuturesUnordered<ChunkTask> = FuturesUnordered::new();
+                let mut ready: BTreeMap<usize, (Option<Headers>, Vec<GetBodyPart>)> = BTreeMap::new();
 
-                    let chunk_params = GetObjectParams {
-                        range: Some(chunk_range),
-                        ..params.clone()
+                scheduler.schedule(&mut inflight, &mut next_chunk_index_to_start);
+
+                while next_chunk_index_to_emit < total_chunks {
+                    while let Ok(()) = read_window_update_receiver.try_recv() {
+                        scheduler.schedule(&mut inflight, &mut next_chunk_index_to_start);
+                    }
+
+                    if inflight.is_empty() {
+                        if read_window_update_receiver.next().await.is_none() {
+                            break;
+                        }
+                        scheduler.schedule(&mut inflight, &mut next_chunk_index_to_start);
+                        continue;
+                    }
+
+                    let Some((index, result)) = inflight.next().await else {
+                        break;
                     };
+                    info!(
+                        index,
+                        inflight = inflight.len(),
+                        ready = ready.len(),
+                        "redirected GetObject split chunk task completed"
+                    );
 
-                    match self_clone.get_object_single(&bucket, &key, &chunk_params, true, true).await {
-                        Ok(mut response) => {
-                            // Send headers from the first chunk
-                            if !headers_sent {
-                                let headers = response.headers.clone();
-                                if event_sender.unbounded_send(S3GetObjectEvent::Headers(headers)).is_err() {
-                                    // Receiver dropped, exit early
-                                    return;
-                                }
-                                headers_sent = true;
-                            }
-
-                            // Stream body parts from this chunk
-                            while let Some(result) = response.next().await {
-                                match result {
-                                    Ok(part) => {
-                                        if event_sender.unbounded_send(S3GetObjectEvent::BodyPart(part)).is_err() {
-                                            // Receiver dropped, exit early
-                                            return;
-                                        }
-                                    }
-                                    Err(e) => {
-                                        let _ = event_sender.unbounded_send(S3GetObjectEvent::Error(e));
-                                        event_sender.close_channel();
-                                        return;
-                                    }
-                                }
-                            }
+                    match result {
+                        Ok(chunk) => {
+                            ready.insert(index, chunk);
                         }
                         Err(e) => {
                             let _ = event_sender.unbounded_send(S3GetObjectEvent::Error(e));
@@ -338,9 +490,34 @@ impl S3CrtClient {
                         }
                     }
 
-                    current_offset = chunk_end;
+                    while let Some((headers, parts)) = ready.remove(&next_chunk_index_to_emit) {
+                        if let Some(headers) = headers
+                            && event_sender.unbounded_send(S3GetObjectEvent::Headers(headers)).is_err()
+                        {
+                            return;
+                        }
+
+                        let part_count = parts.len();
+                        for part in parts {
+                            if event_sender.unbounded_send(S3GetObjectEvent::BodyPart(part)).is_err() {
+                                return;
+                            }
+                        }
+
+                        info!(
+                            chunk_index = next_chunk_index_to_emit,
+                            part_count, "emitting redirected GetObject split chunk"
+                        );
+                        next_chunk_index_to_emit += 1;
+                    }
+
+                    scheduler.schedule(&mut inflight, &mut next_chunk_index_to_start);
                 }
 
+                info!(
+                    emitted_chunks = next_chunk_index_to_emit,
+                    total_chunks, "finished redirected GetObject split"
+                );
                 event_sender.close_channel();
             })
         });
@@ -348,10 +525,11 @@ impl S3CrtClient {
         // Wait for the first chunk's headers before returning
         match event_receiver.next().await {
             Some(S3GetObjectEvent::Headers(headers)) => {
-                // For split mode, return a dummy backpressure handle that allows
-                // unlimited reading. Each chunk handles its own flow internally.
                 let backpressure_handle = if self.inner.enable_backpressure {
-                    Some(S3BackpressureHandle::dummy())
+                    Some(S3BackpressureHandle::new_split(
+                        read_window_end_offset,
+                        read_window_update_sender,
+                    ))
                 } else {
                     None
                 };
@@ -368,7 +546,10 @@ impl S3CrtClient {
             }
             Some(S3GetObjectEvent::Error(e)) => Err(e),
             event => {
-                trace!(?event, "unexpected GetObject event while waiting for headers in split mode");
+                trace!(
+                    ?event,
+                    "unexpected GetObject event while waiting for headers in split mode"
+                );
                 Err(S3RequestError::internal_failure(ResponseHeadersError::MissingHeaders).into())
             }
         }
@@ -388,6 +569,7 @@ pub struct S3BackpressureHandle {
     /// can return data up to this offset *exclusively*.
     read_window_end_offset: Arc<AtomicU64>,
     meta_request: Option<MetaRequest>,
+    read_window_update_sender: Option<UnboundedSender<()>>,
 }
 
 impl S3BackpressureHandle {
@@ -395,24 +577,31 @@ impl S3BackpressureHandle {
         Self {
             read_window_end_offset,
             meta_request: Some(meta_request),
+            read_window_update_sender: None,
         }
     }
 
-    /// Create a dummy backpressure handle that never blocks.
-    /// Used for split mode where each chunk manages its own flow.
-    fn dummy() -> Self {
+    fn new_split(read_window_end_offset: Arc<AtomicU64>, read_window_update_sender: UnboundedSender<()>) -> Self {
         Self {
-            read_window_end_offset: Arc::new(AtomicU64::new(u64::MAX)),
+            read_window_end_offset,
             meta_request: None,
+            read_window_update_sender: Some(read_window_update_sender),
         }
     }
 }
 
 impl ClientBackpressureHandle for S3BackpressureHandle {
     fn increment_read_window(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+
         self.read_window_end_offset.fetch_add(len as u64, Ordering::SeqCst);
         if let Some(mut meta_request) = self.meta_request.clone() {
             meta_request.increment_read_window(len as u64);
+        }
+        if let Some(read_window_update_sender) = &self.read_window_update_sender {
+            let _ = read_window_update_sender.unbounded_send(());
         }
     }
 

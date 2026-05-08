@@ -545,6 +545,9 @@ impl CliArgs {
         filesystem_config.cache_config = self.cache_config();
         filesystem_config.mem_limit = self.mem_limit();
         filesystem_config.use_upload_checksums = self.should_use_upload_checksum(s3_personality);
+        if self.follow_redirects {
+            filesystem_config.prefetcher_config.initial_request_size = 0;
+        }
         filesystem_config
     }
 

@@ -142,9 +142,15 @@ impl ClientConfig {
         memory_pool: PagedPool,
         validate_on_s3_path: Option<&S3Path>,
     ) -> anyhow::Result<S3CrtClient> {
+        let throughput_target_gbps = if self.follow_redirects {
+            self.throughput_target.value().max(80.0)
+        } else {
+            self.throughput_target.value()
+        };
+
         let mut client_config = S3ClientConfig::new()
             .auth_config(self.auth_config)
-            .throughput_target_gbps(self.throughput_target.value())
+            .throughput_target_gbps(throughput_target_gbps)
             .read_part_size(self.part_config.read_size_bytes)
             .write_part_size(self.part_config.write_size_bytes)
             .read_backpressure(true)

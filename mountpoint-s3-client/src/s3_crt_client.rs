@@ -1091,11 +1091,7 @@ impl<'a> S3Message<'a> {
     /// Update the endpoint for this message to follow an HTTP redirect.
     /// Updates the endpoint URI, Host header, and request path to match the redirect target.
     /// Also clears signing configuration and AWS auth headers when redirecting to a presigned URL.
-    fn redirect_to(
-        &mut self,
-        location: &str,
-        allocator: &Allocator,
-    ) -> Result<(), ConstructionError> {
+    fn redirect_to(&mut self, location: &str, allocator: &Allocator) -> Result<(), ConstructionError> {
         let redirect_uri = Uri::new_from_str(allocator, location)?;
 
         let hostname = redirect_uri.host_name();
@@ -1126,8 +1122,7 @@ impl<'a> S3Message<'a> {
         // the original request's AWS signing headers, as the presigned URL
         // already contains authentication. Sending both causes 403 errors.
         // Use anonymous credentials to skip signing completely.
-        let anonymous_provider = CredentialsProvider::new_anonymous(allocator)
-            .map_err(ConstructionError::from)?;
+        let anonymous_provider = CredentialsProvider::new_anonymous(allocator).map_err(ConstructionError::from)?;
         self.signing_config = Some(SigningConfig::new("us-east-1", anonymous_provider));
 
         // Remove AWS signing headers that were added by the CRT.

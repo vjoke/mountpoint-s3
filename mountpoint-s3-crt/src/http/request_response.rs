@@ -357,9 +357,7 @@ impl<'a> Message<'a> {
         let headers = unsafe { aws_http_message_get_headers(self.inner.as_ptr()) };
         assert!(!headers.is_null(), "headers are always initialized");
         // SAFETY: `aws_http_headers_erase` doesn't hold on to a copy of the name
-        unsafe {
-            aws_http_headers_erase(headers, name.as_ref().as_aws_byte_cursor()).ok_or_last_error()
-        }
+        unsafe { aws_http_headers_erase(headers, name.as_ref().as_aws_byte_cursor()).ok_or_last_error() }
     }
 
     /// Set the request path for this message.
