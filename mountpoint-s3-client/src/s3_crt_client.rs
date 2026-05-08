@@ -1127,7 +1127,7 @@ impl<'a> S3Message<'a> {
         // already contains authentication. Sending both causes 403 errors.
         // Use anonymous credentials to skip signing completely.
         let anonymous_provider = CredentialsProvider::new_anonymous(allocator)
-            .map_err(|e| ConstructionError::from(e))?;
+            .map_err(ConstructionError::from)?;
         self.signing_config = Some(SigningConfig::new("us-east-1", anonymous_provider));
 
         // Remove AWS signing headers that were added by the CRT.
@@ -1190,7 +1190,7 @@ impl<T: Send, E: Send> FusedFuture for S3MetaRequest<T, E> {
 /// Wrapper for a [MetaRequest] that cancels it on drop.
 ///
 /// Note that if the request has already completed, cancelling it has no effect.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct CancellingMetaRequest {
     inner: MetaRequest,
 }
