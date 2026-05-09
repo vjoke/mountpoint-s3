@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
-use clap::{ArgAction, ArgGroup, Parser, ValueEnum, value_parser};
+use clap::{ArgGroup, Parser, ValueEnum, value_parser};
 use mountpoint_s3_client::config::{AWSCRT_LOG_TARGET, AddressingStyle, S3ClientAuthConfig};
 use mountpoint_s3_client::instance_info::InstanceInfo;
 use mountpoint_s3_client::user_agent::UserAgent;
@@ -108,16 +108,6 @@ Learn more in Mountpoint's configuration documentation (CONFIGURATION.md).\
 
     #[clap(
         long,
-        default_value_t = true,
-        action = ArgAction::SetTrue,
-        help = "Follow GetObject redirects from S3-compatible endpoints",
-        help_heading = BUCKET_OPTIONS_HEADER
-    )]
-    pub follow_redirects: bool,
-
-    #[clap(
-        long,
-        action = ArgAction::SetTrue,
         help = "Do not follow GetObject redirects from S3-compatible endpoints",
         help_heading = BUCKET_OPTIONS_HEADER
     )]
@@ -821,7 +811,7 @@ impl CliArgs {
             transfer_acceleration: self.transfer_acceleration,
             auth_config: self.auth_config(),
             requester_pays: self.requester_pays,
-            follow_redirects: self.follow_redirects && !self.no_follow_redirects,
+            follow_redirects: !self.no_follow_redirects,
             expected_bucket_owner: self.expected_bucket_owner.clone(),
             throughput_target,
             bind: self.bind.clone(),
@@ -875,13 +865,6 @@ mod tests {
     #[test]
     fn follow_redirects_defaults_to_true() {
         let cli_args = CliArgs::try_parse_from(["mount-s3", "bucket", "test/location"]).unwrap();
-        assert!(cli_args.follow_redirects);
-    }
-
-    #[test]
-    fn follow_redirects_flag_sets_true() {
-        let cli_args = CliArgs::try_parse_from(["mount-s3", "bucket", "test/location", "--follow-redirects"]).unwrap();
-        assert!(cli_args.follow_redirects);
         assert!(cli_args.client_config("test-version").follow_redirects);
     }
 
