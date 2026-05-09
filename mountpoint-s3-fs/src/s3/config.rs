@@ -37,6 +37,9 @@ pub struct ClientConfig {
     /// Set the 'x-amz-request-payer' to 'requester' on S3 requests
     pub requester_pays: bool,
 
+    /// Follow GetObject redirects from S3-compatible endpoints
+    pub follow_redirects: bool,
+
     /// Account ID of the expected bucket owner
     pub expected_bucket_owner: Option<String>,
 
@@ -144,6 +147,7 @@ impl ClientConfig {
             .throughput_target_gbps(self.throughput_target.value())
             .read_part_size(self.part_config.read_size_bytes)
             .write_part_size(self.part_config.write_size_bytes)
+            .follow_redirects(self.follow_redirects)
             .read_backpressure(true)
             .initial_read_window(self.part_config.read_size_bytes)
             .user_agent(self.user_agent)

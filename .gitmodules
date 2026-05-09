@@ -30,4 +30,4 @@
 	url = https://github.com/awslabs/aws-c-auth.git
 [submodule "aws-c-s3"]
 	path = mountpoint-s3-crt-sys/crt/aws-c-s3
-	url = https://github.com/awslabs/aws-c-s3.git
+	url = https://github.com/vjoke/aws-c-s3.git

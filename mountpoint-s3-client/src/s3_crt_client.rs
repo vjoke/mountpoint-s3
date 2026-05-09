@@ -107,6 +107,7 @@ pub struct S3ClientConfig {
     user_agent: Option<UserAgent>,
     request_payer: Option<String>,
     bucket_owner: Option<String>,
+    follow_redirects: bool,
     max_attempts: Option<NonZeroUsize>,
     read_backpressure: bool,
     initial_read_window: usize,
@@ -129,6 +130,7 @@ impl Default for S3ClientConfig {
             user_agent: None,
             request_payer: None,
             bucket_owner: None,
+            follow_redirects: true,
             max_attempts: None,
             read_backpressure: false,
             initial_read_window: DEFAULT_PART_SIZE,
@@ -213,6 +215,13 @@ impl S3ClientConfig {
     #[must_use = "S3ClientConfig follows a builder pattern"]
     pub fn bucket_owner(mut self, bucket_owner: &str) -> Self {
         self.bucket_owner = Some(bucket_owner.to_owned());
+        self
+    }
+
+    /// Follow GetObject redirects returned by S3-compatible endpoints.
+    #[must_use = "S3ClientConfig follows a builder pattern"]
+    pub fn follow_redirects(mut self, follow_redirects: bool) -> Self {
+        self.follow_redirects = follow_redirects;
         self
     }
 
@@ -332,6 +341,7 @@ struct S3CrtClientInner {
     /// Here it will add the user agent prefix and s3 client information.
     user_agent_header: String,
     request_payer: Option<String>,
+    follow_redirects: bool,
     read_part_size: usize,
     write_part_size: usize,
     enable_backpressure: bool,
@@ -473,6 +483,7 @@ impl S3CrtClientInner {
             next_request_counter: AtomicU64::new(0),
             user_agent_header,
             request_payer: config.request_payer,
+            follow_redirects: config.follow_redirects,
             read_part_size: config.read_part_size,
             write_part_size: config.write_part_size,
             enable_backpressure: config.read_backpressure,
@@ -1618,7 +1629,15 @@ mod tests {
         client_new_fails_with_invalid_part_size(part_size);
     }
 
-    /// Test if the prefix is added correctly to the User-Agent header
+    #[test]
+    fn test_follow_redirects_config() {
+        let default_config = S3ClientConfig::default();
+        assert!(default_config.follow_redirects);
+
+        let config = S3ClientConfig::new().follow_redirects(false);
+        assert!(!config.follow_redirects);
+    }
+
     #[test]
     fn test_user_agent_with_prefix() {
         let user_agent_prefix = String::from("someprefix");

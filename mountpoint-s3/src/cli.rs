@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
-use clap::{ArgGroup, Parser, ValueEnum, value_parser};
+use clap::{ArgAction, ArgGroup, Parser, ValueEnum, value_parser};
 use mountpoint_s3_client::config::{AWSCRT_LOG_TARGET, AddressingStyle, S3ClientAuthConfig};
 use mountpoint_s3_client::instance_info::InstanceInfo;
 use mountpoint_s3_client::user_agent::UserAgent;
@@ -105,6 +105,23 @@ Learn more in Mountpoint's configuration documentation (CONFIGURATION.md).\
 
     #[clap(long, help = "Set the 'x-amz-request-payer' to 'requester' on S3 requests", help_heading = BUCKET_OPTIONS_HEADER)]
     pub requester_pays: bool,
+
+    #[clap(
+        long,
+        default_value_t = true,
+        action = ArgAction::SetTrue,
+        help = "Follow GetObject redirects from S3-compatible endpoints",
+        help_heading = BUCKET_OPTIONS_HEADER
+    )]
+    pub follow_redirects: bool,
+
+    #[clap(
+        long,
+        action = ArgAction::SetTrue,
+        help = "Do not follow GetObject redirects from S3-compatible endpoints",
+        help_heading = BUCKET_OPTIONS_HEADER
+    )]
+    pub no_follow_redirects: bool,
 
     #[clap(long, help = "Type of S3 bucket to use [default: inferred from bucket name]", help_heading = BUCKET_OPTIONS_HEADER)]
     pub bucket_type: Option<BucketType>,
@@ -804,6 +821,7 @@ impl CliArgs {
             transfer_acceleration: self.transfer_acceleration,
             auth_config: self.auth_config(),
             requester_pays: self.requester_pays,
+            follow_redirects: self.follow_redirects && !self.no_follow_redirects,
             expected_bucket_owner: self.expected_bucket_owner.clone(),
             throughput_target,
             bind: self.bind.clone(),
@@ -853,6 +871,26 @@ fn parse_bucket_name_or_s3_uri(bucket_name_or_uri: &str) -> Result<BucketNameOrS
 mod tests {
     use super::*;
     use test_case::test_case;
+
+    #[test]
+    fn follow_redirects_defaults_to_true() {
+        let cli_args = CliArgs::try_parse_from(["mount-s3", "bucket", "test/location"]).unwrap();
+        assert!(cli_args.follow_redirects);
+    }
+
+    #[test]
+    fn follow_redirects_flag_sets_true() {
+        let cli_args = CliArgs::try_parse_from(["mount-s3", "bucket", "test/location", "--follow-redirects"]).unwrap();
+        assert!(cli_args.follow_redirects);
+        assert!(cli_args.client_config("test-version").follow_redirects);
+    }
+
+    #[test]
+    fn no_follow_redirects_flag_disables_redirects() {
+        let cli_args =
+            CliArgs::try_parse_from(["mount-s3", "bucket", "test/location", "--no-follow-redirects"]).unwrap();
+        assert!(!cli_args.client_config("test-version").follow_redirects);
+    }
 
     #[test_case("s3://bucket--eun1-az1--x-s3", true; "s3:// example bucket")]
     #[test_case("s3://bucket--eun1-az1--x-s3/", true; "s3:// example bucket with empty prefix")]

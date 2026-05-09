@@ -492,6 +492,15 @@ impl<'a> MetaRequestOptions<'a> {
         self
     }
 
+    /// Follow HTTP redirects for GetObject requests.
+    pub fn follow_redirects(&mut self, follow_redirects: bool) -> &mut Self {
+        // SAFETY: we aren't moving out of the struct.
+        let options = unsafe { Pin::get_unchecked_mut(Pin::as_mut(&mut self.0)) };
+        options.inner.follow_redirects = follow_redirects;
+        options.inner.max_redirect_depth = if follow_redirects { 10 } else { 0 };
+        self
+    }
+
     /// Set this to send request body data using the async [MetaRequest::write] function.
     /// This only works with [MetaRequestType::PutObject].
     pub fn send_using_async_writes(&mut self, send_using_async_writes: bool) -> &mut Self {
