@@ -193,6 +193,7 @@ mod tests {
     #[test_case(["_", "demo_s3_bucket",                                                "/mnt/test", "-o", "\\"].to_vec(),                    false, Ok("".to_string()))]
     #[test_case(["_", "demo_s3_bucket",                                                "/mnt/test", "-o", "\\a"].to_vec(),                   false, Ok("".to_string()))]
     #[test_case(["_", "demo_s3_bucket",                                                "/mnt/test", "-o", "cache=\\\"foo\\\""].to_vec(),     true,  Ok("".to_string()))]
+    #[test_case(["_", "demo_s3_bucket",                                                "/mnt/test", "-o", "no-follow-redirects"].to_vec(),   true,  Ok("".to_string()))]
     #[test_case(["_", "demo_s3_bucket",                                                "/mnt/test", "-o", "cache=\""].to_vec(),              false, Ok("".to_string()))]
     #[test_case(["_", "demo_s3_bucket",                                                "/mnt/test", "-o", "-f"].to_vec(),                    false, Ok("".to_string()))]
     #[test_case(["_", "##############",                                                "/mnt/test", "-o", "ro"].to_vec(),                    false, Ok("".to_string()))]
@@ -212,6 +213,10 @@ mod tests {
         assert_eq!(res.is_ok(), should_parse, "args={args:?}\n res={res:?}");
 
         if let Ok(cli_args) = res {
+            if args.contains(&"no-follow-redirects") {
+                assert!(!cli_args.client_config("test-version").follow_redirects);
+            }
+
             match expected_prefix {
                 Ok(prefix) => {
                     let s3_path = cli_args.s3_path().unwrap();

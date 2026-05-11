@@ -78,6 +78,9 @@ impl S3CrtClient {
 
             let mut options = message.into_options(S3Operation::GetObject);
             options.part_size(self.inner.read_part_size as u64);
+            if self.inner.follow_redirects {
+                options.follow_redirects(true);
+            }
             if let Some(id) = params.custom_id {
                 options.custom_id(id);
             }

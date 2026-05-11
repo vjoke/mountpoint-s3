@@ -146,6 +146,7 @@ impl ConfigOptions {
             transfer_acceleration: false,
             auth_config: Default::default(),
             requester_pays: false,
+            follow_redirects: true,
             expected_bucket_owner: self.expected_bucket_owner.clone(),
             throughput_target,
             bind: None,
