@@ -144,7 +144,9 @@ impl ReaddirHandle {
 
             let Ok(name) = next.name().try_into() else {
                 // Short-circuit the update if we know it'll fail because the name is invalid
-                warn!("{} has an invalid name and will be unavailable", next.description());
+                if !next.is_directory_marker_object() {
+                    warn!("{} has an invalid name and will be unavailable", next.description());
+                }
                 continue;
             };
 
@@ -263,6 +265,13 @@ impl ReaddirEntry {
             Self::RemoteObject { .. } => ReaddirEntryKind::RemoteObject,
             Self::LocalInode { .. } => ReaddirEntryKind::LocalInode,
         }
+    }
+
+    fn is_directory_marker_object(&self) -> bool {
+        matches!(
+            self,
+            Self::RemoteObject { name, full_key, .. } if name.is_empty() && full_key.ends_with('/')
+        )
     }
 
     /// How to describe this entry in an error message
@@ -648,12 +657,34 @@ impl DirHandle {
 }
 #[cfg(test)]
 mod tests {
+    use super::ReaddirEntry;
     use crate::fs::{FUSE_ROOT_INODE, OpenFlags};
     use crate::metablock::{AddDirEntryResult, InodeKind, Metablock};
     use crate::s3::{Bucket, S3Path};
     use crate::superblock::Superblock;
     use crate::sync::Arc;
     use mountpoint_s3_client::mock_client::MockClient;
+    use time::OffsetDateTime;
+
+    fn remote_object_entry(name: &str, full_key: &str) -> ReaddirEntry {
+        ReaddirEntry::RemoteObject {
+            name: name.to_owned(),
+            full_key: full_key.to_owned(),
+            size: 0,
+            last_modified: OffsetDateTime::UNIX_EPOCH,
+            storage_class: None,
+            restore_status: None,
+            etag: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_directory_marker_object_detection() {
+        assert!(remote_object_entry("", "dir/").is_directory_marker_object());
+        assert!(!remote_object_entry("", "dir").is_directory_marker_object());
+        assert!(!remote_object_entry("file", "dir/file/").is_directory_marker_object());
+        assert!(!ReaddirEntry::RemotePrefix { name: String::new() }.is_directory_marker_object());
+    }
 
     /// Verifies that `readdir` gracefully skips local inodes that are no longer tracked
     /// in the parent’s `writing_children`.  
